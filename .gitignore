@@ -1,0 +1,5 @@
+.direnv
+
+# Targets
+bin/
+result/
