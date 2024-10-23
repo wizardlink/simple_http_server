@@ -1,8 +1,9 @@
+#include "server.h"
+#include "parser.h"
 #include <curl/curl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
-#include <regex.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,22 +13,8 @@
 #include <sys/stat.h>
 #include <sys/unistd.h>
 
-#define handle_error(msg)                                                      \
-  do {                                                                         \
-    perror(msg);                                                               \
-    exit(EXIT_FAILURE);                                                        \
-  } while (0)
-
 // 1MB
 const int BUFFER_SIZE = 1000000;
-
-void *handle_request(void *arg);
-char *url_decode(char *str, int len);
-char *get_file_extension(char *text);
-char *get_substring(char *str, int pos);
-void build_response(char *file_name, char *file_ext, char *response,
-                    size_t *response_len);
-char *get_mime_type(char *ext);
 
 int main() {
   int sockfd, *clientfd = 0;
@@ -82,31 +69,64 @@ void *handle_request(void *arg) {
 
   ssize_t received = recv(clientfd, buffer, BUFFER_SIZE, 0);
   if (received > 0) {
-    regex_t regex;
-    regcomp(&regex, "^GET /([^ ]*) HTTP/1", REG_EXTENDED);
-    regmatch_t matches[2];
+    request_info_t *info = parse_request(buffer);
+    char *endpoint = url_decode(info->endpoint);
 
-    int match = regexec(&regex, buffer, 2, matches, 0);
+    if (strcmp(info->method, "GET") == 0) {
+      if (strcmp(endpoint, "/test") == 0) {
+        char *response;
+        FILE *file = fopen("test.txt", "r");
+        char file_data[100000];
 
-    if (match == 0) {
-      buffer[matches[1].rm_eo] = '\0';
-      char *file_name = buffer + matches[1].rm_so;
-      char *decoded_file_name = url_decode(file_name, strlen(file_name));
+        if (file == NULL) {
+          response = internal_server_error();
+        } else {
+          char data[1000];
+          while (fgets(data, sizeof(data), file) != NULL) {
+            strcat(file_data, data);
+          }
 
-      char *file_ext = get_file_extension(decoded_file_name);
+          char formatted_data[100045];
+          sprintf(formatted_data,
+                  "HTTP/1.1 200 OK\r\n"
+                  "Content-Type: text/plain\r\n"
+                  "\r\n"
+                  "%s",
+                  file_data);
+          response = strdup(formatted_data);
+        }
 
-      if (file_ext != NULL) {
-        char *response = malloc(BUFFER_SIZE * 2 * sizeof(char));
-        size_t response_len;
-        build_response(decoded_file_name, file_ext, response, &response_len);
-
-        send(clientfd, response, response_len, 0);
+        send(clientfd, response, strlen(response), 0);
+        fclose(file);
       }
+    } else if (strcmp(info->method, "POST") == 0) {
+      if (strcmp(endpoint, "/test") == 0) {
+        char *response;
+        FILE *file = fopen("test.txt", "w");
 
-      free(file_ext);
+        if (file == NULL) {
+          response = internal_server_error();
+        } else {
+          fprintf(file, "%s", info->content);
+          response = strdup("HTTP/1.1 200 OK\r\n"
+                            "Content-Type: text/plain\r\n"
+                            "\r\n"
+                            "OK");
+        }
+
+        send(clientfd, response, strlen(response), 0);
+
+        fclose(file);
+      }
+    } else {
+      char *page = not_found_page();
+      send(clientfd, page, strlen(page), 0);
     }
 
-    regfree(&regex);
+    free(info);
+  } else {
+    char *page = bad_request_page();
+    send(clientfd, page, strlen(page), 0);
   }
 
   close(clientfd);
@@ -116,7 +136,59 @@ void *handle_request(void *arg) {
   return NULL;
 }
 
-char *url_decode(char *str, int len) {
+char *not_found_page() {
+  return strdup("HTTP/1.1 404 Not Found\r\n"
+                "Content-Type: text/plain\r\n"
+                "\r\n"
+                "404 Not Found");
+}
+
+char *bad_request_page() {
+  return strdup("HTTP/1.1 400 Bad Request\r\n"
+                "Content-Type: text/plain\r\n"
+                "\r\n"
+                "400 Bad Request");
+}
+
+char *forbidden_request_page() {
+  return strdup("HTTP/1.1 403 Forbidden\r\n"
+                "Content-Type: text/plain\r\n"
+                "\r\n"
+                "403 Forbidden");
+}
+
+char *internal_server_error() {
+  return strdup("HTTP/1.1 500 Internal Server Error\n\n"
+                "Content-Type: text/plain\r\n"
+                "\r\n"
+                "500 Internal Server Error");
+}
+
+char *get_substring(char *str, int start, int end) {
+  int sub_iteration = 0;
+  int str_len = strlen(str);
+  char *substring = malloc(str_len * sizeof(char) + 1);
+
+  if (start > str_len)
+    return strdup("");
+
+  for (int i = 0; i < str_len; i++) {
+    if (i == end) {
+      substring[sub_iteration] = '\0';
+      break;
+    }
+
+    if (i < start || i > end)
+      continue;
+
+    substring[sub_iteration] = str[i];
+    sub_iteration++;
+  }
+
+  return substring;
+}
+
+char *url_decode(char *str) {
   int str_len = strlen(str);
   char *decoded_string = str;
 
@@ -143,92 +215,4 @@ char *url_decode(char *str, int len) {
   }
 
   return decoded_string;
-}
-
-char *get_file_extension(char *text) {
-  regex_t regex;
-  regmatch_t matches[2];
-
-  regcomp(&regex, "\\.([A-Za-z]+)$", REG_EXTENDED);
-  int match = regexec(&regex, text, 2, matches, 0);
-
-  if (match == 0)
-    return get_substring(text, matches[1].rm_so);
-
-  return NULL;
-}
-
-char *get_substring(char *str, int pos) {
-  int sub_iteration = 0;
-  int str_len = strlen(str);
-  char *substring = malloc(str_len * sizeof(char) + 1);
-
-  if (pos > str_len)
-    return strdup("");
-
-  for (int i = 0; i < str_len; i++) {
-    if (i < pos)
-      continue;
-
-    substring[sub_iteration] = str[i];
-    sub_iteration++;
-
-    if (i == strlen(str) - 1) {
-      substring[sub_iteration] = '\0';
-      break;
-    }
-  }
-
-  return substring;
-}
-
-void build_response(char *file_name, char *file_ext, char *response,
-                    size_t *response_len) {
-  const char *mime_type = get_mime_type(file_ext);
-  char *header = malloc(BUFFER_SIZE * sizeof(char));
-  snprintf(header, BUFFER_SIZE,
-           "HTTP/1.1 200 OK\r\n"
-           "Content-Type: %s\r\n"
-           "\r\n",
-           mime_type);
-
-  int filefd = open(file_name, O_RDONLY);
-  if (filefd == -1) {
-    snprintf(response, BUFFER_SIZE,
-             "HTTP/1.1 404 Not Found\r\n"
-             "Content-Type: text/plain\r\n"
-             "\r\n"
-             "404 Not Found");
-    *response_len = strlen(response);
-    return;
-  }
-
-  struct stat file_stat;
-  fstat(filefd, &file_stat);
-  off_t file_size = file_stat.st_size;
-
-  *response_len = 0;
-  memcpy(response, header, strlen(header) * sizeof(char));
-  *response_len += strlen(header);
-
-  ssize_t bytes_read;
-  while ((bytes_read = read(filefd, response + *response_len,
-                            BUFFER_SIZE - *response_len)) > 0) {
-    *response_len += bytes_read;
-  }
-
-  free(header);
-  close(filefd);
-}
-
-char *get_mime_type(char *ext) {
-  if (strcmp(ext, "html") == 0) {
-    return strdup("text/html");
-  } else if (strcmp(ext, "md") == 0) {
-    return strdup("text/markdown");
-  } else if (strcmp(ext, "txt") == 0) {
-    return strdup("text/plain");
-  }
-
-  return strdup("");
 }
